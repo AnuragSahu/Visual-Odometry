@@ -6,89 +6,9 @@ from pylab import *
 import math
 from decimal import Decimal
 
-def estimate_fundamental_matrix(points_a, points_b):
-    N=points_a.shape[0]
-    m=np.average(points_a,axis=0)
-    mdash=np.average(points_b,axis=0)
-    m_mean=points_a-m.reshape(1,2)
-    mdash_mean=points_b-mdash.reshape(1,2)
-    s_sum=np.sum((m_mean)**2,axis=None)
-    sdash_sum=np.sum((mdash_mean)**2,axis=None)
-    s=(s_sum/(2*N))**0.5
-    sinv=1/s
-    sdash=(sdash_sum/(2*N))**0.5
-    sdinv=1/sdash
-    x=m_mean*sinv
-    y=mdash_mean*sdinv
-    Y=np.ones((N,9))
-    Y[:,0:2] = x*y[:,0].reshape(N,1)
-    Y[:,2] = y[:,0]
-    Y[:,3:5] = x*y[:,1].reshape(N,1)
-    Y[:,5] = y[:,1]
-    Y[:,6:8] = x
-    u,s,vt = np.linalg.svd(Y,full_matrices=True)
-    F = vt[8,:].reshape(3,3)
-    U, S, Vt = np.linalg.svd(F, full_matrices=True)
-    S[2] = 0
-    Smat = np.diag(S)
-    F = np.dot(U, np.dot( Smat, Vt))
-    T = np.zeros((3,3))
-    T[0,0] = sinv
-    T[1,1] = sinv
-    T[2,2] = 1
-    T[0,2] = -sinv*m[0]
-    T[1,2] = -sinv*m[1]
-
-    Tdash = np.zeros((3,3))
-    Tdash[0,0] = sdinv
-    Tdash[1,1] = sdinv
-    Tdash[2,2] = 1
-    Tdash[0,2] = -sdinv*mdash[0]
-    Tdash[1,2] = -sdinv*mdash[1]
-    F = np.dot( np.transpose( Tdash ), np.dot( F, T ))
-    return F/F[2,2]
-    return F
-
-def denormalize_matrix(F,p1,p2):
+def denormalize_matrix(p1,p2):
     E,mask = findEssentialMat(p1,p2,K,cv2.RANSAC,0.999,1.0)
     return np.linalg.inv(K.T).dot(E.dot(np.linalg.inv(K)))
-
-def ransac_fundamental_matrix(matches_a, matches_b):
-    N=15
-    p1 = matches_a
-    p2 = matches_b
-    S=matches_b.shape[0]
-    r=np.random.randint(S,size=(N,8))
-
-    m=np.ones((3,S))
-    m[0:2,:]=matches_a.T
-    mdash=np.ones((3,S))
-    mdash[0:2,:]=matches_b.T
-    count=np.zeros(N)
-    cost=np.zeros(S)
-    t=1e-4
-    for i in range(N):
-    	cost1=np.zeros(8)
-    	F=estimate_fundamental_matrix(matches_a[r[i,:],:],matches_b[r[i,:],:])
-    	for j in range(S):
-    		cost[j]=np.dot(np.dot(mdash[:,j].T,F),m[:,j])
-    	inlie=np.absolute(cost)<t
-    	count[i]=np.sum(inlie + np.zeros(S),axis=None)
-
-
-    index=np.argsort(-count)
-    best=index[0]
-    best_F=estimate_fundamental_matrix(matches_a[r[best,:],:],matches_b[r[best,:],:])
-    for j in range(S):
-    	cost[j]=np.dot(np.dot(mdash[:,j].T,best_F),m[:,j])
-    confidence=np.absolute(cost)
-    F = denormalize_matrix(F,p1,p2)
-    index=np.argsort(confidence)
-    matches_b=matches_b[index]
-    matches_a=matches_a[index]
-    inliers_a=matches_a[:100,:]
-    inliers_b=matches_b[:100,:]
-    return F
 
 K = np.array([[7.215377000000e+02,0.000000000000e+00,6.095593000000e+02],
               [0.000000000000e+00,7.215377000000e+02,1.728540000000e+02],
@@ -160,9 +80,6 @@ def main():
 
         points = np.array(list(map(lambda x: [x.pt], prev_keypoint)),dtype=np.float32)
         p1, st, err = cv2.calcOpticalFlowPyrLK(prev_image, image, points,None, )
-
-        #E, mask = cv2.findEssentialMat(p1, points, camera_matrix, cv2.RANSAC, 0.999, 1.0, None)
-        #F, mask = cv2.findFundamentalMat(p1, points, cv2.RANSAC, 0.999, 1.0)
         p1_tmp = []
         points_tmp = []
         for a in p1:
@@ -171,7 +88,7 @@ def main():
         for a in points:
             points_tmp.append(a[0])
         points = np.array(points_tmp)
-        F = ransac_fundamental_matrix(p1, points)
+        F = denormalize_matrix(p1, points)
         E = K.T.dot(F.dot(K))
         points, R, t, mask = cv2.recoverPose(E, p1, points, camera_matrix)
         scale = 1.0
