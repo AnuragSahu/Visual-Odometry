@@ -1,148 +1,149 @@
-import os
-import glob
-from cv2 import *
-import numpy as np
-from pylab import *
-import math
-from decimal import Decimal
+import bpy
+from mathutils import Matrix, Vector
 
-def denormalize_matrix(p1,p2):
-    E,mask = findEssentialMat(p1,p2,K,cv2.RANSAC,0.999,1.0)
-    return np.linalg.inv(K.T).dot(E.dot(np.linalg.inv(K)))
+#---------------------------------------------------------------
+# 3x4 P matrix from Blender camera
+#---------------------------------------------------------------
 
-K = np.array([[7.215377000000e+02,0.000000000000e+00,6.095593000000e+02],
-              [0.000000000000e+00,7.215377000000e+02,1.728540000000e+02],
-              [0.000000000000e+00,0.000000000000e+00,1.000000000000e+00]])
+# BKE_camera_sensor_size
+def get_sensor_size(sensor_fit, sensor_x, sensor_y):
+    if sensor_fit == 'VERTICAL':
+        return sensor_y
+    return sensor_x
 
-class LoadDataset():
-    def __init__(self):
-        #pass
-        path = "../q2/images"
-        self.image_format_left = '{:06d}.png'
-        self.path = os.path.join(path)
-        sequence_count = os.path.dirname(self.path).split('/')[-1]
-        gt_path = os.path.join(self.path, '..','ground-truth.txt')
-        self.count_image()
-        self.original_value = self.load_ground_truth_pose(gt_path)
+# BKE_camera_sensor_fit
+def get_sensor_fit(sensor_fit, size_x, size_y):
+    if sensor_fit == 'AUTO':
+        if size_x >= size_y:
+            return 'HORIZONTAL'
+        else:
+            return 'VERTICAL'
+    return sensor_fit
 
-    def image_path_left(self, index):
-        return os.path.join(self.path, self.image_format_left).format(index)
+# Build intrinsic camera parameters from Blender camera data
+#
+# See notes on this in 
+# blender.stackexchange.com/questions/15102/what-is-blenders-camera-projection-matrix-model
+# as well as
+# https://blender.stackexchange.com/a/120063/3581
+def get_calibration_matrix_K_from_blender(camd):
+    if camd.type != 'PERSP':
+        raise ValueError('Non-perspective cameras not supported')
+    scene = bpy.context.scene
+    f_in_mm = camd.lens
+    scale = scene.render.resolution_percentage / 100
+    resolution_x_in_px = scale * scene.render.resolution_x
+    resolution_y_in_px = scale * scene.render.resolution_y
+    sensor_size_in_mm = get_sensor_size(camd.sensor_fit, camd.sensor_width, camd.sensor_height)
+    sensor_fit = get_sensor_fit(
+        camd.sensor_fit,
+        scene.render.pixel_aspect_x * resolution_x_in_px,
+        scene.render.pixel_aspect_y * resolution_y_in_px
+    )
+    pixel_aspect_ratio = scene.render.pixel_aspect_y / scene.render.pixel_aspect_x
+    if sensor_fit == 'HORIZONTAL':
+        view_fac_in_px = resolution_x_in_px
+    else:
+        view_fac_in_px = pixel_aspect_ratio * resolution_y_in_px
+    pixel_size_mm_per_px = sensor_size_in_mm / f_in_mm / view_fac_in_px
+    s_u = 1 / pixel_size_mm_per_px
+    s_v = 1 / pixel_size_mm_per_px / pixel_aspect_ratio
 
-    def count_image(self):
-        extension = os.path.splitext(self.image_format_left)[-1]
-        wildcard = os.path.join(self.path, '*' + extension)
-        self.image_count = len(glob.glob(wildcard))
+    # Parameters of intrinsic calibration matrix K
+    u_0 = resolution_x_in_px / 2 - camd.shift_x * view_fac_in_px
+    v_0 = resolution_y_in_px / 2 + camd.shift_y * view_fac_in_px / pixel_aspect_ratio
+    skew = 0 # only use rectangular pixels
 
-    def load_ground_truth_pose(self, gt_path):
-        original_value = []
-        with open(gt_path) as gt_file:
-            gt_lines = gt_file.readlines()
+    K = Matrix(
+        ((s_u, skew, u_0),
+        (   0,  s_v, v_0),
+        (   0,    0,   1)))
+    return K
 
-            for gt_line in gt_lines:
-                pose = self.convert_text_to_ground_truth(gt_line)
-                original_value.append(pose)
-        return original_value
+# Returns camera rotation and translation matrices from Blender.
+# 
+# There are 3 coordinate systems involved:
+#    1. The World coordinates: "world"
+#       - right-handed
+#    2. The Blender camera coordinates: "bcam"
+#       - x is horizontal
+#       - y is up
+#       - right-handed: negative z look-at direction
+#    3. The desired computer vision camera coordinates: "cv"
+#       - x is horizontal
+#       - y is down (to align to the actual pixel coordinates 
+#         used in digital images)
+#       - right-handed: positive z look-at direction
+def get_3x4_RT_matrix_from_blender(cam):
+    # bcam stands for blender camera
+    R_bcam2cv = Matrix(
+        ((1, 0,  0),
+        (0, -1, 0),
+        (0, 0, -1)))
 
-    def convert_text_to_ground_truth(self, gt_line):
-        matrix = np.array(gt_line.split()).reshape((3, 4)).astype(np.float32)
-        return matrix
+    # Transpose since the rotation is object rotation, 
+    # and we want coordinate rotation
+    # R_world2bcam = cam.rotation_euler.to_matrix().transposed()
+    # T_world2bcam = -1*R_world2bcam * location
+    #
+    # Use matrix_world instead to account for all constraints
+    location, rotation = cam.matrix_world.decompose()[0:2]
+    R_world2bcam = rotation.to_matrix().transposed()
+
+    # Convert camera location to translation vector used in coordinate changes
+    T_world2bcam = -1*R_world2bcam @ cam.location
+    # Use location from matrix_world to account for constraints:     
+    #T_world2bcam = -1*R_world2bcam * location
+
+    # Build the coordinate transform matrix from world to computer vision camera
+    R_world2cv = R_bcam2cv @ R_world2bcam
+    T_world2cv = R_bcam2cv @ T_world2bcam
+
+    # put into 3x4 matrix
+    RT = Matrix((
+        R_world2cv[0][:] + (T_world2cv[0],),
+        R_world2cv[1][:] + (T_world2cv[1],),
+        R_world2cv[2][:] + (T_world2cv[2],)
+        ))
+    return RT
+
+def get_3x4_P_matrix_from_blender(cam):
+    K = get_calibration_matrix_K_from_blender(cam.data)
+    RT = get_3x4_RT_matrix_from_blender(cam)
+    return K @ RT, RT
 
 
-def main():
-    dataset = LoadDataset()
-
-    # Function for Detection of the Features
-    feature_detector = cv2.xfeatures2d.SIFT_create()
-
-    current_pos = np.zeros((3, 1))
-    current_rot = np.eye(3)
-
-    file = open("results.txt","w+")
-    print("{} images found.".format(dataset.image_count))
-
-    prev_image = None
-    camera_matrix = K
-    valid_ground_truth = True
-
-    for index in range(dataset.image_count):
-        # load image
-        image = cv2.imread(dataset.image_path_left(index))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # main process
-        keypoint = feature_detector.detect(image, None)
-
-        #for first case
-        if prev_image is None:
-            prev_image = image
-            prev_keypoint = keypoint
-            continue
-
-        points = np.array(list(map(lambda x: [x.pt], prev_keypoint)),dtype=np.float32)
-        p1, st, err = cv2.calcOpticalFlowPyrLK(prev_image, image, points,None, )
-        p1_tmp = []
-        points_tmp = []
-        for a in p1:
-            p1_tmp.append(a[0])
-        p1 = np.array(p1_tmp)
-        for a in points:
-            points_tmp.append(a[0])
-        points = np.array(points_tmp)
-        F = denormalize_matrix(p1, points)
-        E = K.T.dot(F.dot(K))
-        points, R, t, mask = cv2.recoverPose(E, p1, points, camera_matrix)
-        scale = 1.0
-
-        # calc scale from ground truth if exists.
-
-        original_value = dataset.original_value[index]
-        original_position = [original_value[0, 3], original_value[2, 3]]
-        previous_ground_truth = dataset.original_value[index - 1]
-        previous_ground_truth_pos = [
-            previous_ground_truth[0, 3],
-            previous_ground_truth[2, 3]]
-        scale = math.sqrt(math.pow((original_position[0] - previous_ground_truth_pos[0]), 2.0) + math.pow((original_position[1] - previous_ground_truth_pos[1]), 2.0))
-
-        current_pos += current_rot.dot(t) * scale
-        current_rot = R.dot(current_rot)
-
-        transformation_matrix = np.zeros((3,4))
-        transformation_matrix[:,:-1] = current_rot
-        transformation_matrix[:,-1] = current_pos.T
-
-        transformation_matrix = transformation_matrix.reshape(1,12)
-        count = 0
-        for vals in transformation_matrix[0]:
-            count+=1
-            file.write(str('%.6e'%Decimal(vals)))
+def write_RT_mat(ground_truth,RT):
+    count = 0
+    for i in RT:
+        for j in i:
+            ground_truth.write(str('%.6e'%Decimals(j)))
+            count += 1
             if(count<12):
-                file.write(" ")
-        file.write("\n")
-        if(index == dataset.image_count-1):
-            count = 0
-            for vals in transformation_matrix[0]:
-                count+=1
-                file.write(str('%.6e'%Decimal(vals)))
-                if(count<12):
-                    file.write(" ")
-            file.write("\n")
+                ground_truth.write(" ")
+    ground_truth.write("\n")
 
 
-        # get ground truth if eist.
-            original_value = dataset.original_value[index]
-
-        # calc rotation error with ground truth.
-        original_value = dataset.original_value[index]
-        original_rotation = original_value[0: 3, 0: 3]
-        r_vec, _ = cv2.Rodrigues(current_rot.dot(original_rotation.T))
-        rotation_error = np.linalg.norm(r_vec)
-
-        prev_image = image
-        prev_keypoint = keypoint
-        print((index/dataset.image_count)*100,"%")
-
-    file.close()
-    os.system("evo_traj kitti ground-truth.txt --ref results.txt -va --plot --plot_mode xz")
-
+def write_k_mat(k_mat,K):
+    k_mat.write("[")
+    for i in K:
+        k_mat.write("[")
+        for j in i:
+            k_mat.write(str(j)+str(" "))
+        k_mat.write("],")
+    k_mat.write("]")
+# ----------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    # Insert your camera name here
+    ground_truth = open('../ground_truth_mod.txt','w+')
+    k_mat = open('../k_mat.txt','w+')
+    cam = bpy.data.objects['Camera']
+    K = get_calibration_matrix_K_from_blender(cam.data)
+    write_k_mat(k_mat,K)
+    for f in range(bpy.context.scene.frame_start,bpy.context.scene.frame_end):
+        P, RT = get_3x4_P_matrix_from_blender(cam)
+        write_RT_mat(ground_truth,RT)
+        bpy.context.scene.frame_set(f)
+
+    k_mat.close()
+    ground_truth.close()
